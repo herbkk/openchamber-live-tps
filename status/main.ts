@@ -240,6 +240,23 @@ const describeError = (error: unknown): string => {
   return error instanceof Error ? error.message : String(error);
 };
 
+/**
+ * The same answer with everything session-scoped blanked; connection fields
+ * stay. A page with no session must not read another session's live numbers,
+ * and `sessionId` in the answer names the record the service actually read.
+ */
+const withoutSession = (rate: RateResponse): RateResponse => ({
+  ...rate,
+  busy: false,
+  waiting: null,
+  toolActive: false,
+  live: { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 },
+  running: null,
+  curve: [],
+  turn: { active: false, ttftMs: null },
+  lastTurn: null,
+});
+
 const poll = async (): Promise<void> => {
   if (stopped || polling) return;
   if (!origin) {
@@ -256,7 +273,10 @@ const poll = async (): Promise<void> => {
     });
     if (result.status < 400) {
       const rate = JSON.parse(result.body) as RateResponse;
-      render(rate);
+      // A page with no session must never show another session's numbers:
+      // until this page's watch(null) lands, the service may still answer for
+      // a session some other page watched.
+      render(session === null && rate.sessionId !== null ? withoutSession(rate) : rate);
       // A service that restarted (crash, redeploy, spawned anew) remembers
       // nothing and answers with no session, so the panel would sit on stale
       // state until the frame remounted. Re-assert the watch instead: the

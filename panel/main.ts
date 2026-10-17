@@ -208,6 +208,23 @@ const describeError = (error: unknown): string => {
   return error instanceof Error ? error.message : String(error);
 };
 
+/**
+ * The same answer with everything session-scoped blanked; connection fields
+ * stay. A page with no session must not read another session's live numbers,
+ * and `sessionId` in the answer names the record the service actually read.
+ */
+const withoutSession = (rate: RateResponse): RateResponse => ({
+  ...rate,
+  busy: false,
+  waiting: null,
+  toolActive: false,
+  live: { tps: 0, spanMs: 0, chars: 0, textChars: 0, reasoningChars: 0, toolChars: 0 },
+  running: null,
+  curve: [],
+  turn: { active: false, ttftMs: null },
+  lastTurn: null,
+});
+
 const poll = async (): Promise<void> => {
   if (stopped || polling) return;
   if (!origin) {
@@ -217,8 +234,13 @@ const poll = async (): Promise<void> => {
   polling = true;
   try {
     const result = await host.serviceRequest({ method: 'GET', path: '/rate' });
-    if (result.status < 400) render(JSON.parse(result.body) as RateResponse);
-    else render(null, `HTTP ${result.status}`);
+    if (result.status < 400) {
+      const rate = JSON.parse(result.body) as RateResponse;
+      // A page with no session must never show another session's numbers:
+      // until this page's watch(null) lands, the service may still answer for
+      // a session some other page watched.
+      render(sessionId === null && rate.sessionId !== null ? withoutSession(rate) : rate);
+    } else render(null, `HTTP ${result.status}`);
   } catch (error) {
     render(null, describeError(error));
   } finally {

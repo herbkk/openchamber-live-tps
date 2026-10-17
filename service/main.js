@@ -32,8 +32,7 @@ var readClientToken = () => {
     const value = raw?.desktopLocalClientToken;
     if (typeof value === "string" && value.trim())
       return value.trim();
-  } catch {
-  }
+  } catch {}
   return "";
 };
 var serverHeaders = () => {
@@ -47,9 +46,9 @@ if (!Number.isInteger(port) || port <= 0 || !token) {
   process.exit(1);
 }
 var WINDOW_MS = 1000;
-var CURVE_WINDOW_MS = 3e4;
+var CURVE_WINDOW_MS = 30000;
 var CURVE_BUCKETS = 24;
-var SAMPLE_LIMIT = 2e4;
+var SAMPLE_LIMIT = 20000;
 var RETRY_BASE_MS = 1000;
 var RETRY_MAX_MS = 15000;
 var PROBE_TIMEOUT_MS = 2000;
@@ -198,12 +197,11 @@ var trackSession = (sessionId) => {
   trimSessionStates();
   return created;
 };
-var enterSession = (sessionId) => {
+var loadState = (state) => {
   if (inSession)
-    throw new Error("enterSession called while already inside a session");
-  const state = trackSession(sessionId);
+    throw new Error("loadState called while already inside a session");
   activeSession = state;
-  activeSessionId = sessionId;
+  activeSessionId = state.sessionId || null;
   inSession = true;
   samples = state.samples;
   partChars = state.partChars;
@@ -231,6 +229,11 @@ var enterSession = (sessionId) => {
   turns = state.turns;
   pendingPermissions = state.pendingPermissions;
   pendingQuestions = state.pendingQuestions;
+};
+var enterSession = (sessionId) => {
+  if (inSession)
+    throw new Error("enterSession called while already inside a session");
+  loadState(trackSession(sessionId));
 };
 var leaveSession = () => {
   if (!inSession)
@@ -266,6 +269,7 @@ var leaveSession = () => {
   inSession = false;
   activeSessionId = null;
 };
+var blankSession = createSessionState("");
 var statePaths = () => {
   const override = process.env.OPENCHAMBER_LIVE_TPS_STATE;
   if (override)
@@ -471,9 +475,7 @@ var stepToolWithinMs = (step, fromMs, toMs) => {
   }
   return total;
 };
-var stepReasoningExclMs = (step) => {
-  return 0;
-};
+var stepReasoningExclMs = (_step) => 0;
 var MAX_PLAUSIBLE_TOKENS_PER_SECOND = 5000;
 var plausibleRate = (tokens, ms) => {
   if (!(ms >= 1))
@@ -1044,9 +1046,9 @@ var parseEndpoint = (value) => {
     return { host: plain[1], port: Number(plain[2]) };
   return null;
 };
-var toOrigin = (scheme, host, port2) => {
+var toOrigin = (scheme, host, port) => {
   const dial = host === "" || host === "*" || host === "0.0.0.0" || host === "::" ? "127.0.0.1" : host;
-  return `${scheme}://${dial.includes(":") ? `[${dial}]` : dial}:${port2}`;
+  return `${scheme}://${dial.includes(":") ? `[${dial}]` : dial}:${port}`;
 };
 var runFile = async (file, args) => {
   const { stdout } = await execFileAsync(file, args, {
@@ -1416,6 +1418,8 @@ var server = http.createServer((req, res) => {
     const requested = readString(url.searchParams.get("sessionId")) || watch?.sessionId || null;
     if (requested !== null)
       enterSession(requested);
+    else
+      loadState(blankSession);
     let body;
     try {
       body = {
@@ -1437,8 +1441,7 @@ var server = http.createServer((req, res) => {
         eventsSeen
       };
     } finally {
-      if (requested !== null)
-        leaveSession();
+      leaveSession();
     }
     json(res, 200, body);
     return;

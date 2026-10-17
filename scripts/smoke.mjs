@@ -501,6 +501,55 @@ await sleep(150);
 await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
 await sleep(200);
 
+// --- a new conversation must never read another session's numbers ------------
+// The status page of a brand-new chat registers `sessionId: null` and then
+// polls bare `/rate`. With a watch registered the last one still answers (see
+// "bare /rate still answers for the last watch" above); with no watch at all
+// the answer used to come from the register the last event left behind, so the
+// empty chat showed whichever *other* session had just streamed. It must
+// answer "no session": empty numbers, no turn, no last turn.
+ev('session.execution.started', { sessionID: OTHER });
+ev('session.step.started', { sessionID: OTHER, assistantMessageID: 'msgNew' });
+for (let i = 0; i < 3; i += 1) {
+  ev('session.text.delta', { sessionID: OTHER, assistantMessageID: 'msgNew', ordinal: 0, delta: 'n'.repeat(50) });
+  await sleep(60);
+}
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: null }) });
+await sleep(120);
+const newChat = await (await svcFetch('/rate')).json();
+check(
+  'a new conversation reads no live numbers',
+  newChat.sessionId === null && newChat.busy === false && newChat.live.chars === 0 && newChat.live.tps === 0,
+  JSON.stringify({ sessionId: newChat.sessionId, busy: newChat.busy, live: newChat.live }),
+);
+check(
+  'a new conversation reads no active turn',
+  newChat.turn.active === false && newChat.running === null && newChat.toolActive === false && newChat.waiting === null,
+  JSON.stringify({ turn: newChat.turn, running: newChat.running, waiting: newChat.waiting }),
+);
+const otherStreaming = await (await svcFetch(`/rate?sessionId=${OTHER}`)).json();
+check(
+  'the streaming session still reads its own live numbers',
+  otherStreaming.sessionId === OTHER && otherStreaming.busy === true && otherStreaming.live.chars > 0,
+  JSON.stringify({ sessionId: otherStreaming.sessionId, busy: otherStreaming.busy, live: otherStreaming.live }),
+);
+// Settle OTHER while the new conversation is still the latest watch: a
+// finished turn must not leak either.
+ev('session.step.ended', { sessionID: OTHER, assistantMessageID: 'msgNew', tokens: { output: 20, reasoning: 0 } });
+ev('session.execution.succeeded', { sessionID: OTHER });
+await sleep(150);
+const newChatSettled = await (await svcFetch('/rate')).json();
+check(
+  'a new conversation reads no finished turn',
+  newChatSettled.lastTurn === null && newChatSettled.busy === false,
+  JSON.stringify({ lastTurn: newChatSettled.lastTurn, busy: newChatSettled.busy }),
+);
+// Registering a session again brings the numbers back.
+await svcFetch('/watch', { method: 'POST', body: JSON.stringify({ origin: sseOrigin, sessionId: SESSION }) });
+await sleep(200);
+const backOnSession = await (await svcFetch('/rate')).json();
+check('re-watching a session brings its numbers back', backOnSession.sessionId === SESSION, `sessionId=${backOnSession.sessionId}`);
+
 // --- turn 14: missed execution.started must not stick the turn on idle -----
 // Regression for the "tools running but status shows idle/empty" report:
 // the service attached after the turn began, so no `execution.started` was

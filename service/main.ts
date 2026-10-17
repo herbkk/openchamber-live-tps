@@ -446,17 +446,11 @@ const trackSession = (sessionId: string): SessionState => {
   return created;
 };
 
-/**
- * Load `sessionId`'s record into the module-level variables. Everything read
- * and written between `enterSession` and `leaveSession` belongs to that
- * session. The two never nest: the stream delivers one event at a time and
- * `/rate` answers without awaiting, so there is no `await` to interleave them.
- */
-const enterSession = (sessionId: string): void => {
-  if (inSession) throw new Error('enterSession called while already inside a session');
-  const state = trackSession(sessionId);
+/** Point the module-level register at `state`; `leaveSession` copies it back. */
+const loadState = (state: SessionState): void => {
+  if (inSession) throw new Error('loadState called while already inside a session');
   activeSession = state;
-  activeSessionId = sessionId;
+  activeSessionId = state.sessionId || null;
   inSession = true;
   samples = state.samples;
   partChars = state.partChars;
@@ -484,6 +478,17 @@ const enterSession = (sessionId: string): void => {
   turns = state.turns;
   pendingPermissions = state.pendingPermissions;
   pendingQuestions = state.pendingQuestions;
+};
+
+/**
+ * Load `sessionId`'s record into the module-level variables. Everything read
+ * and written between `enterSession` and `leaveSession` belongs to that
+ * session. The two never nest: the stream delivers one event at a time and
+ * `/rate` answers without awaiting, so there is no `await` to interleave them.
+ */
+const enterSession = (sessionId: string): void => {
+  if (inSession) throw new Error('enterSession called while already inside a session');
+  loadState(trackSession(sessionId));
 };
 
 /** Copy the register back into the record it was loaded from. */
@@ -520,6 +525,18 @@ const leaveSession = (): void => {
   inSession = false;
   activeSessionId = null;
 };
+
+/**
+ * The record a `/rate` is answered from when no session is named.
+ *
+ * A new conversation's status page watches `sessionId: null` until its first
+ * message exists, and a bare `/rate` used to be answered from the register the
+ * last streamed event left behind — still mirroring whichever *other* session
+ * had just streamed — so the brand-new chat showed a background conversation's
+ * live numbers. This record is never tracked, persisted, or dispatched into,
+ * so it stays blank: what "no session yet" should show.
+ */
+const blankSession = createSessionState('');
 
 /**
  * Where the durable numbers live.
@@ -1938,9 +1955,12 @@ const server = http.createServer((req, res) => {
     const now = Date.now();
     // A page names its own session so two pages watching different sessions
     // each read their own record. Without the parameter the most recent watch
-    // answers, which is what a one-page install has always seen.
+    // answers, which is what a one-page install has always seen; with no watch
+    // either, the blank record answers — never the register the last event
+    // left behind, which belongs to whichever session streamed most recently.
     const requested = readString(url.searchParams.get('sessionId')) || watch?.sessionId || null;
     if (requested !== null) enterSession(requested);
+    else loadState(blankSession);
     let body: Record<string, unknown>;
     try {
       body = {
@@ -1966,7 +1986,7 @@ const server = http.createServer((req, res) => {
         eventsSeen,
       };
     } finally {
-      if (requested !== null) leaveSession();
+      leaveSession();
     }
     json(res, 200, body);
     return;
