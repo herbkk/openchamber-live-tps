@@ -1,9 +1,11 @@
 import { connectHost, HostRequestError } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
-import { drawSpark, makeSparkSvg } from '../shared/spark';
+import { clearSpark as clearSparkPaths, drawSpark, makeSparkSvg, nextScale, type SparkFrame } from '../shared/spark';
 
 const SPARK_W = 248;
 const SPARK_H = 36;
+/** Narrowest believable fallback step for a service that predates the timestamps. */
+const SPARK_WINDOW_MS = 30_000;
 
 type Live = {
   tps: number;
@@ -35,6 +37,12 @@ type RateResponse = {
   live: Live;
   running: { tps: number; source: 'tokens' | 'estimate' } | null;
   curve: number[];
+  /** Epoch ms of the first bucket; absent from an older service. */
+  curveStart?: number;
+  /** Bucket width in ms; absent from an older service. */
+  curveStep?: number;
+  /** Epoch ms the curve was computed at; absent from an older service. */
+  curveAt?: number;
   turn: { active: boolean; ttftMs: number | null };
   lastTurn: TurnResult | null;
   eventsSeen: number;
@@ -88,6 +96,11 @@ let mounted = false;
 let polling = false;
 let stopped = false;
 let configuredKey = '';
+/** Latest curve from the service, when this page received it, and its full scale. */
+let sparkFrame: SparkFrame | null = null;
+let sparkFrameAt = 0;
+let sparkScale = 1;
+let sparkPaintedAt = 0;
 const titleEl = document.createElement('h1');
 const stateLine = document.createElement('div');
 const dot = document.createElement('span');
@@ -135,6 +148,41 @@ const formatSecs = (ms: number | null): string => {
   return s >= 10 ? `${s.toFixed(0)}s` : `${s.toFixed(1)}s`;
 };
 
+/**
+ * The wire curve plus the clock it was measured against. A service older than
+ * the timestamps is read as a window ending at now, which is what that service
+ * meant, so a mid-update mix still draws something sane.
+ */
+const sparkFrameFrom = (rate: RateResponse): SparkFrame => {
+  const step = rate.curveStep && rate.curveStep > 0 ? rate.curveStep : SPARK_WINDOW_MS / Math.max(1, rate.curve.length);
+  const at = rate.curveAt ?? Date.now();
+  const startAt = rate.curveStart ?? at - rate.curve.length * step;
+  return { values: rate.curve, startAt, stepMs: step, at };
+};
+
+/**
+ * Redraw between polls against a projected clock.
+ *
+ * The service answers every 250 ms, which is a fifth of a bucket: at one point
+ * per poll the curve would jump two pixels at a time. Sliding the window edge
+ * with the wall clock turns those jumps into a continuous pan, while the point
+ * values stay exactly what the service measured.
+ */
+const paintSpark = (): void => {
+  if (stopped) return;
+  const frame = sparkFrame;
+  const at = performance.now();
+  // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
+  // repainting the whole panel sixty times a second on an idle session.
+  if (frame && frame.values.length > 0 && at - sparkPaintedAt >= 30) {
+    sparkPaintedAt = at;
+    const elapsed = Math.min(2_000, at - sparkFrameAt);
+    sparkScale = nextScale(sparkScale, frame.values);
+    drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
+  }
+  requestAnimationFrame(paintSpark);
+};
+
 const render = (rate: RateResponse | null, notice: string | null = null): void => {
   if (!rate) {
     dot.className = 'dot';
@@ -174,7 +222,14 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
 
   // The curve is owned by the service: it survives panel reloads and
   // session switches, and is a rolling rate window rather than turn history.
-  drawSpark(sparkParts, rate.curve, SPARK_W, SPARK_H);
+  // An empty curve means the answer belongs to no session, so nothing is drawn
+  // rather than the previous session's shape being left on screen.
+  sparkFrame = sparkFrameFrom(rate);
+  sparkFrameAt = performance.now();
+  if (sparkFrame.values.length === 0) {
+    sparkFrame = null;
+    clearSparkPaths(sparkParts);
+  }
 
   const lt = rate.lastTurn;
   lastEl.textContent = lt
@@ -279,6 +334,7 @@ const mount = (): void => {
   stopped = false;
   void configure(sessionId);
   void poll();
+  requestAnimationFrame(paintSpark);
   const loop = () => {
     if (stopped) return;
     window.setTimeout(async () => {

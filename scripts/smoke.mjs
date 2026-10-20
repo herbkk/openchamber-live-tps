@@ -647,6 +647,53 @@ check(
   curveLengths.every((n) => n === curveLengths[0] && n > 1),
   JSON.stringify(curveLengths),
 );
+// The old curve re-cut its 24 slices at "now" on every poll, so each edge slid
+// a fifth of a bucket every 250 ms and one chunk changed buckets repeatedly —
+// the shape breathed in place instead of sliding. On the absolute grid an edge
+// either stays put or advances by whole buckets, which is what lets the guest
+// draw a translation. The timestamps travel with the values for that reason.
+const edges = [];
+for (let i = 0; i < 8; i += 1) {
+  const polled = await (await svcFetch('/rate')).json();
+  edges.push({
+    start: polled.curveStart,
+    step: polled.curveStep,
+    at: polled.curveAt,
+    length: polled.curve.length,
+    values: polled.curve,
+  });
+  await sleep(80);
+}
+check(
+  'curve buckets sit on an absolute grid',
+  edges.every((e) => e.step === 1250 && Number.isFinite(e.start) && e.start % e.step === 0),
+  JSON.stringify(edges.map((e) => [e.start, e.step])),
+);
+check(
+  'bucket edges never slide between polls',
+  edges.every((e, i) => {
+    if (i === 0) return true;
+    const delta = e.start - edges[i - 1].start;
+    return delta >= 0 && delta % e.step === 0;
+  }),
+  JSON.stringify(edges.map((e) => e.start)),
+);
+check(
+  'curve ends on the newest complete bucket',
+  edges.every((e) => {
+    const end = e.start + e.length * e.step;
+    return end <= e.at && e.at - end < e.step;
+  }),
+  JSON.stringify(edges.map((e) => [e.start + e.length * e.step, e.at])),
+);
+// The same bucket must read the same from two polls: a value that changes
+// while its x stands still is the deformation, whichever way it moves.
+check(
+  'a bucket reads the same for as long as its edges hold',
+  edges.every((e, i) => i === 0 || e.start !== edges[i - 1].start
+    || JSON.stringify(e.values) === JSON.stringify(edges[i - 1].values)),
+  JSON.stringify(edges.map((e) => e.values)),
+);
 ev('session.execution.succeeded', { sessionID: SESSION });
 await sleep(150);
 

@@ -617,9 +617,9 @@ var finalizeTurn = (now) => {
   schedulePersist();
   clearTurn();
 };
-var pruneSamples = (now) => {
+var pruneSamples = (cutoff) => {
   let expired = 0;
-  while (expired < samples.length && now - samples[expired].at > CURVE_WINDOW_MS) {
+  while (expired < samples.length && samples[expired].at < cutoff) {
     expired += 1;
   }
   if (expired > 0)
@@ -1282,7 +1282,6 @@ var stopStream = () => {
   connection = "idle";
 };
 var computeLive = (now) => {
-  pruneSamples(now);
   const from = now - WINDOW_MS;
   let chars = 0;
   let textChars = 0;
@@ -1316,22 +1315,22 @@ var computeLive = (now) => {
   };
 };
 var computeCurve = (now) => {
-  pruneSamples(now);
   const width = CURVE_WINDOW_MS / CURVE_BUCKETS;
-  const oldest = now - CURVE_WINDOW_MS;
-  const out = [];
-  for (let b = 0;b < CURVE_BUCKETS; b += 1) {
-    const from = oldest + b * width;
-    const to = from + width;
-    let chars = 0;
-    for (const sample of samples) {
-      if (sample.at < from || sample.at >= to)
-        continue;
-      chars += sample.chars;
-    }
-    out.push(Math.min(estimateTokens(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+  const newest = Math.floor(now / width) * width;
+  const oldest = newest - CURVE_WINDOW_MS;
+  pruneSamples(oldest);
+  const buckets = new Array(CURVE_BUCKETS).fill(0);
+  for (const sample of samples) {
+    if (sample.at < oldest || sample.at >= newest)
+      continue;
+    const b = Math.min(CURVE_BUCKETS - 1, Math.floor((sample.at - oldest) / width));
+    buckets[b] += sample.chars;
   }
-  return out;
+  const values = [];
+  for (let b = 0;b < CURVE_BUCKETS; b += 1) {
+    values.push(Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+  }
+  return { values, startAt: oldest, stepMs: width };
 };
 var isHttpOrigin = (value) => {
   try {
@@ -1422,6 +1421,7 @@ var server = http.createServer((req, res) => {
       loadState(blankSession);
     let body;
     try {
+      const curve = computeCurve(now);
       body = {
         connection,
         error: lastError,
@@ -1432,7 +1432,10 @@ var server = http.createServer((req, res) => {
         toolActive: toolActive(),
         live: computeLive(now),
         running: turnStartedAt !== null ? computeRunning() : null,
-        curve: computeCurve(now),
+        curve: curve.values,
+        curveStart: curve.startAt,
+        curveStep: curve.stepMs,
+        curveAt: now,
         turn: {
           active: turnStartedAt !== null,
           ttftMs: liveTtftMs()

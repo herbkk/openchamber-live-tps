@@ -1006,9 +1006,15 @@ const finalizeTurn = (now: number): void => {
   clearTurn();
 };
 
-const pruneSamples = (now: number): void => {
+/**
+ * Drop samples older than `cutoff`. Only the curve prunes: its oldest bucket
+ * edge can sit a full bucket before `now - CURVE_WINDOW_MS`, so the caller
+ * passes that edge rather than a window measured from "now" — pruning from
+ * "now" would leave the oldest bucket half empty and understate its rate.
+ */
+const pruneSamples = (cutoff: number): void => {
   let expired = 0;
-  while (expired < samples.length && now - samples[expired].at > CURVE_WINDOW_MS) {
+  while (expired < samples.length && samples[expired].at < cutoff) {
     expired += 1;
   }
   if (expired > 0) samples.splice(0, expired);
@@ -1774,7 +1780,6 @@ const computeLive = (now: number): {
   reasoningChars: number;
   toolChars: number;
 } => {
-  pruneSamples(now);
   const from = now - WINDOW_MS;
   let chars = 0;
   let textChars = 0;
@@ -1817,35 +1822,52 @@ const computeLive = (now: number): {
  * that peaked at 523 pushed a live 120 down to a quarter of the height, which
  * read as the graph collapsing on the right.
  *
- * The length is always `CURVE_BUCKETS` and the buckets are fixed slices of the
- * window, so the x-axis and the scale hold still between polls instead of
- * rescaling whenever a bucket empties. Trailing silence is kept rather than
- * trimmed: the line decays to the floor while the model thinks or a tool runs,
- * which is what actually happened, rather than the tail being cut off to hide
- * it. A window with nothing in it draws that floor rather than nothing at all,
- * so the sparkline never disappears on a session that has gone quiet.
+ * The length is always `CURVE_BUCKETS`, and the bucket edges sit on a fixed
+ * absolute grid (`floor(t / width)`), not at `now - k * width`. Anchoring them
+ * at "now" re-cut every slice on each 250 ms poll: the edges slid 20% of a
+ * bucket per poll, so one chunk moved between neighbouring buckets, a spike
+ * split in two and merged again, and the shape deformed in place while the x
+ * positions stood still. On the absolute grid a chunk belongs to the same
+ * bucket for its whole life, so the curve can only translate (see
+ * `shared/spark.ts` for the matching x mapping).
+ *
+ * Only complete buckets are drawn, and each divides by the full width. The
+ * bucket still filling would otherwise change height as it slides: divided by
+ * its elapsed time it reads a huge rate the moment one chunk lands in it, and
+ * divided by the full width it starts near the floor and climbs. Either way
+ * the leading point deforms, which is the artifact this curve exists to avoid.
+ *
+ * Trailing silence is kept rather than trimmed: the line decays to the floor
+ * while the model thinks or a tool runs, which is what actually happened,
+ * rather than the tail being cut off to hide it. A window with nothing in it
+ * draws that floor rather than nothing at all, so the sparkline never
+ * disappears on a session that has gone quiet.
  */
-const computeCurve = (now: number): number[] => {
-  pruneSamples(now);
+const computeCurve = (now: number): { values: number[]; startAt: number; stepMs: number } => {
   const width = CURVE_WINDOW_MS / CURVE_BUCKETS;
-  const oldest = now - CURVE_WINDOW_MS;
-  const out: number[] = [];
+  // The newest edge at or before `now`: every drawn bucket is one that has
+  // already happened in full.
+  const newest = Math.floor(now / width) * width;
+  const oldest = newest - CURVE_WINDOW_MS;
+  pruneSamples(oldest);
+  const buckets = new Array<number>(CURVE_BUCKETS).fill(0);
+  for (const sample of samples) {
+    if (sample.at < oldest || sample.at >= newest) continue;
+    // Every sample before the newest edge falls inside the 24 buckets above;
+    // the clamp only guards the index against rounding.
+    const b = Math.min(CURVE_BUCKETS - 1, Math.floor((sample.at - oldest) / width));
+    buckets[b] += sample.chars;
+  }
+  const values: number[] = [];
   for (let b = 0; b < CURVE_BUCKETS; b += 1) {
-    const from = oldest + b * width;
-    const to = from + width;
-    let chars = 0;
-    for (const sample of samples) {
-      if (sample.at < from || sample.at >= to) continue;
-      chars += sample.chars;
-    }
     // A bucket is a fixed slice of the window, so its rate is what it holds
     // across its own width. Measuring the span the samples covered read a
     // bucket holding one chunk as that chunk over 1 ms, and sparkPaths
     // normalizes by the largest point, so a single such bucket flattened every
     // other point on the curve.
-    out.push(Math.min(estimateTokens(chars) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
+    values.push(Math.min(estimateTokens(buckets[b]) / (width / 1000), MAX_PLAUSIBLE_TOKENS_PER_SECOND));
   }
-  return out;
+  return { values, startAt: oldest, stepMs: width };
 };
 
 const isHttpOrigin = (value: string): boolean => {
@@ -1963,6 +1985,7 @@ const server = http.createServer((req, res) => {
     else loadState(blankSession);
     let body: Record<string, unknown>;
     try {
+      const curve = computeCurve(now);
       body = {
         connection,
         error: lastError,
@@ -1977,7 +2000,13 @@ const server = http.createServer((req, res) => {
         toolActive: toolActive(),
         live: computeLive(now),
         running: turnStartedAt !== null ? computeRunning() : null,
-        curve: computeCurve(now),
+        // The buckets' own clock travels with them: without it a guest can
+        // only place them on an index axis, which is what made the curve
+        // deform instead of slide. `curveAt` is the window's right edge.
+        curve: curve.values,
+        curveStart: curve.startAt,
+        curveStep: curve.stepMs,
+        curveAt: now,
         turn: {
           active: turnStartedAt !== null,
           ttftMs: liveTtftMs(),

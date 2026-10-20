@@ -1,6 +1,6 @@
 import { connectHost, HostRequestError } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
-import { drawSpark, makeSparkSvg } from '../shared/spark';
+import { clearSpark as clearSparkPaths, drawSpark, makeSparkSvg, nextScale, type SparkFrame } from '../shared/spark';
 
 type Live = {
   tps: number;
@@ -36,6 +36,12 @@ type RateResponse = {
   running: { tps: number; source: 'tokens' | 'estimate' } | null;
   /** Drawn curve owned by the service: one rate per bucket of the last 30 s. */
   curve: number[];
+  /** Epoch ms of the first bucket; absent from an older service. */
+  curveStart?: number;
+  /** Bucket width in ms; absent from an older service. */
+  curveStep?: number;
+  /** Epoch ms the curve was computed at; absent from an older service. */
+  curveAt?: number;
   turn: { active: boolean; ttftMs: number | null };
   lastTurn: TurnResult | null;
   eventsSeen: number;
@@ -86,6 +92,8 @@ type Copy = Record<keyof (typeof COPY)['zh'], string>;
 
 const SPARK_W = 120;
 const SPARK_H = 18;
+/** Narrowest believable fallback window for a service that predates the timestamps. */
+const SPARK_WINDOW_MS = 30_000;
 /** Floor between watch re-asserts, so a service that is down costs one call a second, not one per poll. */
 const REASSERT_MIN_MS = 1_000;
 
@@ -103,6 +111,11 @@ let configuredKey = '';
 let configuring = false;
 let lastReassertAt = 0;
 let heightReported = false;
+/** Latest curve from the service, when this page received it, and its full scale. */
+let sparkFrame: SparkFrame | null = null;
+let sparkFrameAt = 0;
+let sparkScale = 1;
+let sparkPaintedAt = 0;
 
 const row1 = document.createElement('div');
 row1.className = 'row';
@@ -147,6 +160,44 @@ const formatSecs = (ms: number | null): string => {
   return s >= 10 ? `${s.toFixed(0)}s` : `${s.toFixed(1)}s`;
 };
 
+/**
+ * The wire curve plus the clock it was measured against. A service older than
+ * the timestamps is read as a window ending at now, which is what that service
+ * meant, so a mid-update mix still draws something sane.
+ */
+const sparkFrameFrom = (rate: RateResponse): SparkFrame => {
+  const step = rate.curveStep && rate.curveStep > 0 ? rate.curveStep : SPARK_WINDOW_MS / Math.max(1, rate.curve.length);
+  const at = rate.curveAt ?? Date.now();
+  const startAt = rate.curveStart ?? at - rate.curve.length * step;
+  return { values: rate.curve, startAt, stepMs: step, at };
+};
+
+const dropSpark = (): void => {
+  sparkFrame = null;
+  sparkScale = 1;
+  clearSparkPaths(sparkParts);
+};
+
+/**
+ * Redraw between polls against a projected clock, so the curve slides instead
+ * of stepping two pixels at a time four times a second. The point values stay
+ * exactly what the service measured; only the window edge moves.
+ */
+const paintSpark = (): void => {
+  if (stopped) return;
+  const frame = sparkFrame;
+  const at = performance.now();
+  // ~30 fps is enough for a 2 px/slide and keeps a decorative curve from
+  // repainting the whole section sixty times a second on an idle session.
+  if (frame && frame.values.length > 0 && at - sparkPaintedAt >= 30) {
+    sparkPaintedAt = at;
+    const elapsed = Math.min(2_000, at - sparkFrameAt);
+    sparkScale = nextScale(sparkScale, frame.values);
+    drawSpark(sparkParts, frame, frame.at + elapsed, SPARK_W, SPARK_H, sparkScale);
+  }
+  requestAnimationFrame(paintSpark);
+};
+
 const fitHeight = (): void => {
   const h = Math.min(320, Math.max(24, Math.ceil(root.scrollHeight) + 2));
   if (h !== lastHeight) {
@@ -167,7 +218,7 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
     valueEl.textContent = '—';
     setState(notice ?? copy.connecting);
     lastEl.textContent = '';
-    drawSpark(sparkParts, [], SPARK_W, SPARK_H);
+    dropSpark();
     fitHeight();
     return;
   }
@@ -208,7 +259,11 @@ const render = (rate: RateResponse | null, notice: string | null = null): void =
 
   // The curve is owned by the service: it survives iframe remounts and
   // session switches, and is a rolling rate window rather than turn history.
-  drawSpark(sparkParts, rate.curve, SPARK_W, SPARK_H);
+  // An empty curve means the answer belongs to no session, so nothing is drawn
+  // rather than the previous session's shape being left on screen.
+  sparkFrame = sparkFrameFrom(rate);
+  sparkFrameAt = performance.now();
+  if (sparkFrame.values.length === 0) dropSpark();
 
   // Second row: last-turn average + TTFT. Prefer the finished turn; while a
   // turn runs, show its TTFT so far.
@@ -334,6 +389,7 @@ const mount = (): void => {
   stopped = false;
   void configure(session?.id ?? null);
   void poll();
+  requestAnimationFrame(paintSpark);
   const loop = () => {
     if (stopped) return;
     window.setTimeout(async () => {
