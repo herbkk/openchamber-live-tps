@@ -25,6 +25,7 @@ import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { tokensFromChars } from '../shared/tokens';
+import { passwordAuthHeaders } from './auth';
 
 const execFileAsync = promisify(execFile);
 
@@ -40,10 +41,11 @@ const execFileAsync = promisify(execFile);
  *
  * desktopLocalClientToken is the local-only credential the OpenChamber CLI
  * itself reads from the same file to make desktop-local API calls. It is not
- * the UI password, it only means anything to an OpenChamber running on this
- * machine, and it is absent on a headless install - where the stream is
- * unauthenticated anyway. OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN overrides the
- * lookup for an install that would rather pass it in.
+ * the UI password, and it only means anything to an OpenChamber running on
+ * this machine. A headless install has no desktop token, so a 401 also falls
+ * back to the instance file's UI password in `passwordAuthHeaders()`.
+ * OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN overrides the token lookup, and
+ * OPENCHAMBER_LIVE_TPS_UI_PASSWORD overrides the instance-file password.
  */
 const dataDir = (): string => {
   const override = process.env.OPENCHAMBER_DATA_DIR;
@@ -340,6 +342,8 @@ let turns: TurnPoint[] = [];
  */
 type SessionState = {
   sessionId: string;
+  /** Model behind this session's turn, kept apart from the others' models. */
+  currentModel: string;
   /** Last time this record was touched; drives the tracked-session cap. */
   lastSeenAt: number;
   samples: Sample[];
@@ -383,6 +387,7 @@ const TRACKED_CAP = SESSIONS_CAP;
 
 const createSessionState = (sessionId: string): SessionState => ({
   sessionId,
+  currentModel: '*',
   lastSeenAt: Date.now(),
   samples: [],
   partChars: new Map(),
@@ -452,6 +457,7 @@ const loadState = (state: SessionState): void => {
   activeSession = state;
   activeSessionId = state.sessionId || null;
   inSession = true;
+  currentModel = state.currentModel;
   samples = state.samples;
   partChars = state.partChars;
   deltaParts = state.deltaParts;
@@ -495,6 +501,7 @@ const enterSession = (sessionId: string): void => {
 const leaveSession = (): void => {
   if (!inSession) return;
   const state = activeSession;
+  state.currentModel = currentModel;
   state.lastSeenAt = Date.now();
   state.samples = samples;
   state.partChars = partChars;
@@ -1610,6 +1617,7 @@ const probeEventStream = async (origin: string, signal: AbortSignal): Promise<'s
     const response = await fetch(new URL('/api/global/event', origin), {
       headers: { Accept: 'text/event-stream', ...serverHeaders() },
       signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
+      redirect: 'manual',
     });
     const body = response.body;
     if (body) void body.cancel().catch(() => undefined);
@@ -1697,7 +1705,29 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
       response = await fetch(new URL('/api/global/event', origin), {
         headers: { Accept: 'text/event-stream', ...serverHeaders() },
         signal: local.signal,
+        redirect: 'manual',
       });
+      // A desktop-local token is tried first above. A headless host has no such
+      // token, so its instance password is the only credential available.
+      if (response.status === 401 || response.status === 403) {
+        await response.body?.cancel();
+        const endpoints = await parentListenEndpoints();
+        if (local.signal.aborted) return;
+        const headers = await passwordAuthHeaders(
+          origin,
+          dataDir(),
+          new Set(endpoints.map((endpoint) => endpoint.port)),
+          local.signal,
+        );
+        if (local.signal.aborted) return;
+        if (Object.keys(headers).length > 0) {
+          response = await fetch(new URL('/api/global/event', origin), {
+            headers: { Accept: 'text/event-stream', ...headers },
+            signal: local.signal,
+            redirect: 'manual',
+          });
+        }
+      }
     } catch (error) {
       if (local.signal.aborted) return;
       lastError = error instanceof Error ? error.message : String(error);
@@ -1705,8 +1735,10 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
       continue;
     }
     if (!response.ok || !response.body) {
-      scheduleReconnect(`Event stream answered HTTP ${response.status}`, 'http');
-      return;
+      lastError = `Event stream answered HTTP ${response.status}`;
+      lastErrorKind = 'http';
+      await response.body?.cancel();
+      continue;
     }
     connection = 'live';
     retryDelay = RETRY_BASE_MS;
@@ -1748,7 +1780,7 @@ const startStream = async (tried: ReadonlySet<string> = new Set()): Promise<void
     await startStream(seen);
     return;
   }
-  scheduleReconnect(lastError ?? 'Event stream unreachable', 'network');
+  scheduleReconnect(lastError ?? 'Event stream unreachable', lastErrorKind ?? 'network');
 };
 
 /**

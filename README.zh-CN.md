@@ -25,27 +25,24 @@
 
 ## 安装
 
-下面统一用 `~/.config/openchamber/extensions/live-tps`，放哪儿都行。
+打开 **设置 → 扩展**，把下面这个地址粘进 **Folder, ZIP, or URL**，点 **Add**：
 
-```bash
-mkdir -p ~/.config/openchamber/extensions
-cd ~/.config/openchamber/extensions
-git clone https://gitee.com/pzwzx/openchamber-live-tps.git live-tps
-cd live-tps
-bun install
-bun run build
+```text
+https://github.com/wwwzzzxxx/openchamber-live-tps
 ```
 
-然后启动 OpenChamber，在 **设置 → 扩展** 里允许一次本地服务——每个界面（桌面、浏览器、手机）各问一次，service 重启后再问也正常。
+然后允许本地服务。仓库里已经带了构建好的 JavaScript，所以从 Git 安装不需要 `bun install` 或构建；仓库发布新版本后 OpenChamber 会提示更新。每个界面（桌面、浏览器、手机）各问一次，service 重启后再问也正常。
 
-GitHub 快的话用 `https://github.com/wwwzzzxxx/openchamber-live-tps.git`。
+要改代码的话，把仓库 clone 下来，跑 `bun install` 和 `bun run build`，再把 checkout 的绝对路径加进 **设置 → 扩展**。
+
+GitHub 慢的话用 Gitee 镜像：`https://gitee.com/pzwzx/openchamber-live-tps`。
 
 ## 验证
 
 随便打开一个对话，打开工作状态面板（`Choose sections`），把 `Live TPS` 摆到想要的位置。等模型开始生成，就能看到实时数字。
 
 ```bash
-npm test   # 70 项断言，约 12 秒
+npm test   # smoke + 鉴权/校准回归测试
 ```
 
 ## 口径
@@ -90,7 +87,11 @@ service 还会自己探测父进程的回环端口去找 `/api/global/event`，�
 
 SDK 刻意不让 service 继承 host 环境——「API key、UI 密码和其他 host 密钥永远不会到 service 手里」——所以 service 没有任何能带凭证访问 server API 的通道。用户没设 UI 密码时 `/api/global/event` 是开放的；一旦设了，所有 `/api/*` 都回 401，这个扩展就瞎了。
 
-所以 service 会从 `$OPENCHAMBER_DATA_DIR/settings.json`（默认 `~/.config/openchamber`）里读 `desktopLocalClientToken`，以 `Authorization: Bearer ...` 发出去——这正是 OpenChamber CLI 自己做本机 API 调用时的鉴权方式。它只是一个回环凭证，只对本机的 OpenChamber 有意义；无界面安装没有这个字段，而那种环境本来也不要求鉴权。也可以用 `OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN` 显式指定。
+所以 service 会从 `$OPENCHAMBER_DATA_DIR/settings.json`（默认 `~/.config/openchamber`）里读 `desktopLocalClientToken`，以 `Authorization: Bearer ...` 发出去——这正是 OpenChamber CLI 自己做本机 API 调用时的鉴权方式。它只是一个回环凭证，只对本机的 OpenChamber 有意义。也可以用 `OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN` 显式指定。
+
+无界面安装没有这个 token。事件流仍然回 401 时，service 会从 `$OPENCHAMBER_DATA_DIR/run/openchamber-<port>.json`（host 写出的实例文件，权限 0600）里读 `uiPassword`，在 `/auth/session` 登录，然后只把拿到的 cookie 发回同一个回环地址。登录和事件请求都不跟随重定向；数据目录对 service 不可见时，可以用 `OPENCHAMBER_LIVE_TPS_UI_PASSWORD` 直接给密码，或用 `OPENCHAMBER_DATA_DIR` 指向非默认目录。
+
+作用域更窄的桌面 token 永远先试；密码只是拿不到 token 的 host 的兜底。它确实读了 SDK 通常不让 service 接触的 host 密钥，所以只限父进程自己的回环监听端口。
 
 ## 已知边界
 

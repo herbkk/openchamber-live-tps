@@ -1,8 +1,8 @@
 // service/main.ts
 import http from "node:http";
-import fs from "node:fs";
+import fs2 from "node:fs";
 import os from "node:os";
-import path from "node:path";
+import path2 from "node:path";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
@@ -15,20 +15,69 @@ var tokensFromChars = (chars, algorithm = "heuristic") => {
   return Math.ceil(chars / (algorithm === "code" ? CHARS_DIV_3 : CHARS_DIV_4));
 };
 
+// service/auth.ts
+import fs from "node:fs/promises";
+import path from "node:path";
+var isLoopbackHost = (hostname) => hostname === "127.0.0.1" || hostname === "localhost" || hostname === "::1" || hostname === "[::1]";
+var readRecord = async (file) => {
+  try {
+    const value = JSON.parse(await fs.readFile(file, "utf8"));
+    return value !== null && typeof value === "object" && !Array.isArray(value) ? value : {};
+  } catch {
+    return {};
+  }
+};
+var passwordAuthHeaders = async (origin, dataDir, parentPorts, signal) => {
+  let url;
+  try {
+    url = new URL(origin);
+  } catch {
+    return {};
+  }
+  if (!isLoopbackHost(url.hostname))
+    return {};
+  const port = Number(url.port || (url.protocol === "https:" ? 443 : 80));
+  if (!Number.isInteger(port) || !parentPorts.has(port))
+    return {};
+  let password = process.env.OPENCHAMBER_LIVE_TPS_UI_PASSWORD?.trim() ?? "";
+  if (!password) {
+    const instance = await readRecord(path.join(dataDir, "run", `openchamber-${port}.json`));
+    const value = instance.uiPassword;
+    if (typeof value === "string")
+      password = value;
+  }
+  if (!password)
+    return {};
+  try {
+    const response = await fetch(new URL("/auth/session", url), {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({ password }),
+      signal: AbortSignal.any([signal, AbortSignal.timeout(2000)]),
+      redirect: "manual"
+    });
+    const cookie = response.headers.get("set-cookie")?.match(/(?:^|,\s*)(oc_ui_session(?:_\d+)?=[^;]+)/)?.[1];
+    await response.body?.cancel();
+    if (response.ok && cookie)
+      return { Cookie: cookie };
+  } catch {}
+  return {};
+};
+
 // service/main.ts
 var execFileAsync = promisify(execFile);
 var dataDir = () => {
   const override = process.env.OPENCHAMBER_DATA_DIR;
   if (override && override.trim())
-    return path.resolve(override.trim());
-  return path.join(os.homedir(), ".config", "openchamber");
+    return path2.resolve(override.trim());
+  return path2.join(os.homedir(), ".config", "openchamber");
 };
 var readClientToken = () => {
   const override = process.env.OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN;
   if (override && override.trim())
     return override.trim();
   try {
-    const raw = JSON.parse(fs.readFileSync(path.join(dataDir(), "settings.json"), "utf8"));
+    const raw = JSON.parse(fs2.readFileSync(path2.join(dataDir(), "settings.json"), "utf8"));
     const value = raw?.desktopLocalClientToken;
     if (typeof value === "string" && value.trim())
       return value.trim();
@@ -138,6 +187,7 @@ var watched = new Set;
 var TRACKED_CAP = SESSIONS_CAP;
 var createSessionState = (sessionId) => ({
   sessionId,
+  currentModel: "*",
   lastSeenAt: Date.now(),
   samples: [],
   partChars: new Map,
@@ -203,6 +253,7 @@ var loadState = (state) => {
   activeSession = state;
   activeSessionId = state.sessionId || null;
   inSession = true;
+  currentModel = state.currentModel;
   samples = state.samples;
   partChars = state.partChars;
   deltaParts = state.deltaParts;
@@ -239,6 +290,7 @@ var leaveSession = () => {
   if (!inSession)
     return;
   const state = activeSession;
+  state.currentModel = currentModel;
   state.lastSeenAt = Date.now();
   state.samples = samples;
   state.partChars = partChars;
@@ -275,8 +327,8 @@ var statePaths = () => {
   if (override)
     return [override];
   const entry = process.argv[1];
-  const beside = entry ? path.dirname(entry) : process.cwd();
-  return [path.join(beside, ".live-tps-state.json"), path.join(os.tmpdir(), "openchamber-live-tps-state.json")];
+  const beside = entry ? path2.dirname(entry) : process.cwd();
+  return [path2.join(beside, ".live-tps-state.json"), path2.join(os.tmpdir(), "openchamber-live-tps-state.json")];
 };
 var memoryOf = (state) => ({
   lastTurn: state.lastTurn,
@@ -284,7 +336,7 @@ var memoryOf = (state) => ({
 });
 var readSessions = (file) => {
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
     if (!parsed || parsed.version !== PERSIST_VERSION || !parsed.sessions)
       return {};
     const out = {};
@@ -299,7 +351,7 @@ var readSessions = (file) => {
 };
 var readModels = (file) => {
   try {
-    const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+    const parsed = JSON.parse(fs2.readFileSync(file, "utf8"));
     const out = {};
     const models = parsed && typeof parsed.models === "object" ? parsed.models : null;
     if (models) {
@@ -351,8 +403,8 @@ var writePersisted = () => {
         models: { ...readModels(file), ...Object.fromEntries(calibration) }
       });
       const tmp = `${file}.${process.pid}.tmp`;
-      fs.writeFileSync(tmp, payload, "utf8");
-      fs.renameSync(tmp, file);
+      fs2.writeFileSync(tmp, payload, "utf8");
+      fs2.renameSync(tmp, file);
       return;
     } catch {}
   }
@@ -662,7 +714,7 @@ var recordChars = (messageID, partID, kind, chars, now) => {
 var isWatchedSession = (sessionID) => typeof sessionID === "string" && activeSessionId !== null && sessionID === activeSessionId;
 var readString = (value) => typeof value === "string" ? value : "";
 var readNumber = (value) => typeof value === "number" && Number.isFinite(value) ? value : 0;
-var readRecord = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
+var readRecord2 = (value) => value !== null && typeof value === "object" && !Array.isArray(value) ? value : null;
 var fragmentPartID = (messageID, kind, ordinal) => {
   if (!messageID)
     return "";
@@ -692,13 +744,13 @@ var settleStep = (messageID, output, reasoning, now) => {
   closeStepTool(step, now);
 };
 var eventSessionID = (event) => {
-  const payload = readRecord(event.data) ?? readRecord(event.properties);
+  const payload = readRecord2(event.data) ?? readRecord2(event.properties);
   if (!payload)
     return null;
   const direct = readString(payload.sessionID);
   if (direct)
     return direct;
-  const form = readRecord(payload.form);
+  const form = readRecord2(payload.form);
   return form ? readString(form.sessionID) : "";
 };
 var handleEvent = (event, now) => {
@@ -716,7 +768,7 @@ var dispatchEvent = (event, now) => {
   const type = normType(readString(event.type));
   if (!type)
     return;
-  const payload = readRecord(event.data) ?? readRecord(event.properties);
+  const payload = readRecord2(event.data) ?? readRecord2(event.properties);
   if (!payload)
     return;
   if (type === "session.text.delta" || type === "session.reasoning.delta") {
@@ -881,7 +933,7 @@ var dispatchEvent = (event, now) => {
     const messageID = readString(payload.assistantMessageID);
     if (!messageID)
       return;
-    const model = readString(payload.modelID) || readString(readRecord(payload.model)?.id);
+    const model = readString(payload.modelID) || readString(readRecord2(payload.model)?.id);
     if (model)
       currentModel = model;
     const existing = steps.get(messageID);
@@ -900,7 +952,7 @@ var dispatchEvent = (event, now) => {
     if (!isWatchedSession(payload.sessionID))
       return;
     markActive(now);
-    const tokens = readRecord(payload.tokens);
+    const tokens = readRecord2(payload.tokens);
     if (!tokens)
       return;
     settleStep(readString(payload.assistantMessageID), readNumber(tokens.output), readNumber(tokens.reasoning), now);
@@ -956,7 +1008,7 @@ var dispatchEvent = (event, now) => {
     return;
   }
   if (type === "form.created") {
-    const form = readRecord(payload.form);
+    const form = readRecord2(payload.form);
     if (!form || !isWatchedSession(form.sessionID))
       return;
     const requestId = readString(form.id);
@@ -995,7 +1047,7 @@ var dispatchEvent = (event, now) => {
   if (type === "session.status") {
     if (!isWatchedSession(payload.sessionID))
       return;
-    const status = readRecord(payload.status);
+    const status = readRecord2(payload.status);
     const nextBusy = status?.type === "busy" || status?.type === "retry";
     if (busy && !nextBusy)
       finalizeTurn(now);
@@ -1128,7 +1180,8 @@ var probeEventStream = async (origin, signal) => {
   try {
     const response = await fetch(new URL("/api/global/event", origin), {
       headers: { Accept: "text/event-stream", ...serverHeaders() },
-      signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)])
+      signal: AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]),
+      redirect: "manual"
     });
     const body = response.body;
     if (body)
@@ -1207,8 +1260,25 @@ var startStream = async (tried = new Set) => {
     try {
       response = await fetch(new URL("/api/global/event", origin), {
         headers: { Accept: "text/event-stream", ...serverHeaders() },
-        signal: local.signal
+        signal: local.signal,
+        redirect: "manual"
       });
+      if (response.status === 401 || response.status === 403) {
+        await response.body?.cancel();
+        const endpoints = await parentListenEndpoints();
+        if (local.signal.aborted)
+          return;
+        const headers = await passwordAuthHeaders(origin, dataDir(), new Set(endpoints.map((endpoint) => endpoint.port)), local.signal);
+        if (local.signal.aborted)
+          return;
+        if (Object.keys(headers).length > 0) {
+          response = await fetch(new URL("/api/global/event", origin), {
+            headers: { Accept: "text/event-stream", ...headers },
+            signal: local.signal,
+            redirect: "manual"
+          });
+        }
+      }
     } catch (error) {
       if (local.signal.aborted)
         return;
@@ -1217,8 +1287,10 @@ var startStream = async (tried = new Set) => {
       continue;
     }
     if (!response.ok || !response.body) {
-      scheduleReconnect(`Event stream answered HTTP ${response.status}`, "http");
-      return;
+      lastError = `Event stream answered HTTP ${response.status}`;
+      lastErrorKind = "http";
+      await response.body?.cancel();
+      continue;
     }
     connection = "live";
     retryDelay = RETRY_BASE_MS;
@@ -1265,7 +1337,7 @@ var startStream = async (tried = new Set) => {
     await startStream(seen);
     return;
   }
-  scheduleReconnect(lastError ?? "Event stream unreachable", "network");
+  scheduleReconnect(lastError ?? "Event stream unreachable", lastErrorKind ?? "network");
 };
 var beginStream = () => {
   startStream().catch((error) => {

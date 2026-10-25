@@ -27,20 +27,21 @@ no tokenizer. See [Counting](#counting).
 
 ## Install
 
-`~/.config/openchamber/extensions/live-tps` is used throughout; any directory works.
+Open **Settings → Extensions**, paste this URL into **Folder, ZIP, or URL**, and
+choose **Add**:
 
-```bash
-mkdir -p ~/.config/openchamber/extensions
-cd ~/.config/openchamber/extensions
-git clone https://github.com/wwwzzzxxx/openchamber-live-tps.git live-tps
-cd live-tps
-bun install
-bun run build
+```text
+https://github.com/wwwzzzxxx/openchamber-live-tps
 ```
 
-Then start OpenChamber and approve the local service once in **Settings →
-Extensions** — every surface (desktop, browser, mobile) asks separately, and
-asking again after the service restarts is normal.
+Approve the local service. The repository includes the built JavaScript files,
+so a Git install needs no dependency install or build. OpenChamber offers an
+update when the repository publishes a newer package version. Every surface
+(desktop, browser, mobile) asks for the service separately, and asking again
+after the service restarts is normal.
+
+For development, clone the repository, run `bun install` and `bun run build`,
+then add the checkout's absolute path in **Settings → Extensions**.
 
 A Gitee mirror is at `https://gitee.com/pzwzx/openchamber-live-tps` if GitHub is
 slow.
@@ -52,7 +53,7 @@ Open any session, then open the Work Status panel (`Choose sections`) and place
 running number above.
 
 ```bash
-npm test   # 70 assertions, ~12s
+npm test   # smoke plus authentication/calibration regressions
 ```
 
 ## Counting
@@ -137,9 +138,22 @@ The service therefore reads `desktopLocalClientToken` out of
 `$OPENCHAMBER_DATA_DIR/settings.json` (default `~/.config/openchamber`) and sends
 it as `Authorization: Bearer ...`, which is how the OpenChamber CLI authenticates
 its own desktop-local API calls. It is a loopback-only credential, meaningless to
-anything but an OpenChamber on this machine, and it is absent on a headless
-install — where the stream is unauthenticated anyway. Set
+anything but an OpenChamber on this machine. Set
 `OPENCHAMBER_LIVE_TPS_CLIENT_TOKEN` to pass a token in explicitly instead.
+
+A headless install has no desktop token. When the stream still answers 401, the
+service reads `uiPassword` from
+`$OPENCHAMBER_DATA_DIR/run/openchamber-<port>.json` (the instance file the host
+writes with mode 0600), signs in at `/auth/session`, and sends the resulting
+cookie only to that loopback origin. Login and stream requests do not follow
+redirects, and `OPENCHAMBER_LIVE_TPS_UI_PASSWORD` can supply the password when
+the data directory is not visible to the service; `OPENCHAMBER_DATA_DIR` points
+at a non-default one.
+
+The scoped desktop token is always tried first. The password path is the
+fallback for a host that cannot issue one, and it does read a secret the SDK
+normally keeps out of the service environment — limited to the parent process's
+loopback listener.
 
 ## Limitations
 
